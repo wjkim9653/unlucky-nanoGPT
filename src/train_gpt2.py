@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import tiktoken
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch's LayerNorm always has a bias, but GPT-2 uses none. """
@@ -106,6 +107,49 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # language modeling head (classifier)
 
+        # weight tying scheme: the token embedding weights and the lm_head weights are the same
+        self.lm_head.weight = self.transformer.wte.weight
+        # this improves performance slightly and reduces the number of parameters (by nearly 30% !)
+
+        # initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+
+        # forward the GPT model
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos_embd = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_embd)  # WHY? ("apply dropout to the sum of token and position embeddings")
+        for block in self.transformer.h:
+            x = block(x)  # pass through each transformer block
+        x = self.transformer.ln_f(x)  # final layer norm
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)  # (b, t, vocab_size)
+            # compute cross-entropy loss, ignoring padding index -1
+            # reshape logits from (b, t, vocab_size) to (b*t, vocab_size), and reshape targets from (b, t) to (b*t)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :])  # note: using x[:, [-1], :] to keep the time dimension
+            loss = None
+        
+        return logits, loss
+
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -161,5 +205,165 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
-model = GPT.from_pretrained('gpt2')
-print("Model loaded successfully.")
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B  # batch size
+        self.T = T  # sequence length
+
+        # at init, load tokens from disk & store them in memory
+        with open("data/tiny_shakespeare/input.txt", "r", encoding="utf-8") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} tokens from dataset")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches(iterations)")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]  # buffer of (B*T + 1) tokens (+1 for targets)
+        x = (buf[:-1]).view(B, T)  # inputs
+        y = (buf[1:]).view(B, T)   # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would be out of bounds, reset to beginning
+        if self.current_position + (B + T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
+""" Uncomment to run generation example"""
+# num_return_sequences = 10
+# max_length = 150
+
+# # model = GPT.from_pretrained('gpt2')
+# model = GPT(config=GPTConfig())
+# print("Model loaded successfully.")
+
+# model.eval()
+# model.to("cuda")
+
+# import tiktoken
+# enc = tiktoken.get_encoding("gpt2")
+
+# tokens = enc.encode("Hello, I'm a language model,")
+# tokens = torch.tensor(tokens, dtype=torch.long)  # (8,)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (num_return_sequences, 8) -> (5, 8)
+# x = tokens.to("cuda")
+
+# # generate! right now x is (B, T) where B is 5, T is 8
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+# while x.size(1) < max_length:
+#     logits = model(x)[0]  # (B, T, vocab_size)
+#     # take the logits from the last time step
+#     logits = logits[:, -1, :]  # (B, vocab_size)
+#     # get the probabilities
+#     probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
+#     # do top-k sampling of 50 (huggingface piepeline default)
+#     # top-k probs here becomes (5, 50), top-k indices becomes (5, 50)
+#     topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)  # (B, k)
+#     # select a token from the top-k probabilities
+#     ix = torch.multinomial(topk_probs, num_samples=1)  # (B, 1)
+#     # gather the corresponding indicies
+#     xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
+#     # append to the sequence
+#     x = torch.cat((x, xcol), dim=1)  # (B, T+1)
+
+# # decode and print all the sequences
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print(">", decoded)
+
+
+"""Uncomment to run a update example"""
+# # get a data batch
+# import tiktoken
+# enc = tiktoken.get_encoding("gpt2")
+
+# with open("data/tiny_shakespeare/input.txt", "r", encoding="utf-8") as f:
+#     text = f.read()
+# text = text[:1000]
+# tokens=  enc.encode(text)
+# B, T = 4, 32
+# buf = torch.tensor(tokens[:B*T + 1])  # (B*T + 1,)
+# buf = buf.to("cuda")
+# x = buf[:-1].view(B, T)  # (B, T), input
+# y = buf[1:].view(B, T)   # (B, T), target
+
+# # get logits
+# model = GPT(config=GPTConfig())
+# model.to("cuda")
+
+# # optimize
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# for i in range(50):
+#     optimizer.zero_grad()  # clear out previous gradients
+#     logits, loss = model(x, y)  # forward pass
+#     loss.backward()  # backward pass
+#     optimizer.step()  # update the parameters
+#     print(f"step {i+1}, loss: {loss.item():.5f}")
+
+# import sys; sys.exit()
+
+"""Uncomment to run a data loader example"""
+data_loader = DataLoaderLite(B=4, T=32)
+
+model = GPT(config=GPTConfig())
+model.to("cuda")
+
+# optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(1000):
+    x, y = data_loader.next_batch()
+    x, y = x.to("cuda"), y.to("cuda")
+    optimizer.zero_grad()  # clear out previous gradients
+    logits, loss = model(x, y)  # forward pass
+    loss.backward()  # backward pass
+    optimizer.step()  # update the parameters
+    print(f"step {i+1}, loss: {loss.item():.5f}")
+
+# import sys; sys.exit()
+
+
+num_return_sequences = 5
+max_length = 150
+
+model.eval()
+model.to("cuda")
+
+enc = tiktoken.get_encoding("gpt2")
+
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long)  # (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (num_return_sequences, 8) -> (5, 8)
+x = tokens.to("cuda")
+
+# generate! right now x is (B, T) where B is 5, T is 8
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    logits = model(x)[0]  # (B, T, vocab_size)
+    # take the logits from the last time step
+    logits = logits[:, -1, :]  # (B, vocab_size)
+    # get the probabilities
+    probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
+    # do top-k sampling of 50 (huggingface piepeline default)
+    # top-k probs here becomes (5, 50), top-k indices becomes (5, 50)
+    topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)  # (B, k)
+    # select a token from the top-k probabilities
+    ix = torch.multinomial(topk_probs, num_samples=1)  # (B, 1)
+    # gather the corresponding indicies
+    xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
+    # append to the sequence
+    x = torch.cat((x, xcol), dim=1)  # (B, T+1)
+
+# decode and print all the sequences
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
